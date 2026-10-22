@@ -63,6 +63,35 @@ func (m *mountSyscallInfo) process() (*sysResponse, error) {
 	// sysbox-fs.
 	if mh.IsNewMount(m.Flags) {
 
+		// Block new mounts of binfmt_misc from inside the container.
+		// Rationale: kernel >= 6.7 makes binfmt_misc per-user-namespace;
+		// mounting it inside a sysbox container's userns creates a fresh
+		// empty instance that shadows the host's parent-userns
+		// registrations (the kernel's load_binfmt_misc stops walking
+		// parents at the first instance it finds). Any in-container
+		// attempt to mount binfmt_misc — for example docker/setup-qemu-
+		// action's `tonistiigi/binfmt --install all` which mounts then
+		// writes registrations without the P (preserve-argv0) flag —
+		// would break QEMU cross-arch emulation for the rest of the
+		// pod's lifetime.
+		//
+		// By rejecting the syscall here with EPERM, the container's
+		// /proc/sys/fs/binfmt_misc remains the empty directory sysbox
+		// provides by default. The kernel then walks to the parent
+		// user namespace at exec time and uses the host's binfmt
+		// registrations transparently — assuming sysbox-mgr is also
+		// running with --disable-binfmt-misc-mount so it doesn't
+		// auto-mount an empty per-userns instance itself.
+		//
+		// tonistiigi/binfmt's --install logs the error but exits 0,
+		// making this a soft no-op from setup-qemu-action's perspective
+		// while preserving cross-arch via host inheritance.
+		if m.FsType == "binfmt_misc" {
+			logrus.Infof("Denying in-container mount of binfmt_misc fs type at %s (sysbox-fs blocks per-userns binfmt_misc mounts to preserve host cross-arch inheritance); pid=%d cntr=%s",
+				m.Target, m.syscallCtx.pid, m.cntr.ID())
+			return m.tracer.createErrorResponse(m.reqId, syscall.EPERM), nil
+		}
+
 		mip, err := mts.NewMountInfoParser(m.cntr, m.processInfo, true, true, false)
 		if err != nil {
 			return nil, err
